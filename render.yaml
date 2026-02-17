@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: football-plan-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python football_plan_bot.py
+    autoDeploy: true
