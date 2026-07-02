@@ -1,5 +1,41 @@
 # -*- coding: utf-8 -*-
 """
+v298 — ORDER_COUNT: закрыт пол ">=2 ордера" во всех точках (по замечанию ревьюера к v297)
+
+  ════════════════════════════════════════════════════════════
+  Вся стратегия построена на СТРОГО >=2 ордерах в сетке (усреднение: первый ордер +
+  второй ниже по цене). build_grid() и раньше форсировал `order_count = max(2, order_count)`
+  (v291-1) прямо перед постройкой сетки — но это была ЕДИНСТВЕННАЯ точка защиты. Во всех
+  местах, где CFG.ORDER_COUNT читается ДЛЯ РАСЧЁТА РАЗМЕРА ордера (не количества), либо
+  записывается программно, гарантии ">=2" не было — были только разрозненные `min(2, X)`
+  ("не больше 2"), которые НЕ являются полом и пропускали 1 при X=1.
+  ════════════════════════════════════════════════════════════
+
+  НАЙДЕНО И ИСПРАВЛЕНО (все правки помечены [FIX-v298-BUG]):
+  1. apply_mode(SNIPER): `CFG.ORDER_COUNT = p["order_count"]` без ограничения снизу.
+  2. _activity_profile(): 'order_count_cap' для 'conservative'/'balanced' считался как
+     max(1, min(N,...)) — floor 1, а не 2.
+  3. dynamic_order_count(): все 3 внутренних max(1, ...) — включая cap и оба return —
+     могли вернуть 1 ордер, особенно в 'conservative' activity-режиме.
+  4. _dynamic_usdt_per_order(): `_n_orders = max(1, ORDER_COUNT)` — при ORDER_COUNT=1
+     бюджет на ордер делился на 1 (удваивался), а build_grid всё равно строил 2 ордера
+     (v291-1) → скрытое удвоение реальной экспозиции против плана.
+  5. АВТО-РАСПРЕДЕЛЕНИЕ БАЛАНСА (AOS_*): фолбэк `AOS_ORDERS_UNDER_50` по умолчанию был 1
+     (несогласован с реальным дефолтом в Config, который =2!) — самый частый в этом файле
+     случай баланса <50 USDT (все примеры про депозит $25) мог давать _n=1 → и удвоенный
+     размер ордера, и CFG.ORDER_COUNT=1 одновременно.
+  6. build_grid(): `_max_possible = max(1, ...)` при нехватке баланса тихо откатывал
+     order_count обратно до 1 ПОСЛЕ floor'а v291-1 — ровно в сценарии "баланс мал", где
+     усреднение нужнее всего. Реальная проверка платёжеспособности на КАЖДЫЙ ордер всё
+     равно происходит внутри place_limit_buy(), так что floor=2 здесь ничем не рискует.
+  7. Telegram `/set orders 1` — раньше принимался (валидация `x<1 or x>3`), позволяя
+     оператору вручную сломать инвариант. Теперь принимаются только 2 или 3.
+  8. Восстановление learned_cfg после рестарта: `min(2, ORDER_COUNT)` — комментарий
+     называл это "guard", но min() — это только потолок, не пол. Добавлен реальный пол.
+
+  Компиляция проверена: ast.parse + py_compile + pyflakes (0 undefined names) после правок.
+  ════════════════════════════════════════════════════════════
+
 v297 — АУДИТ И ИСПРАВЛЕНИЕ КОРНЕВЫХ БАГОВ (найдено построчным аудитом всех 18239 строк v296)
 
   ════════════════════════════════════════════════════════════
@@ -1887,7 +1923,7 @@ except ImportError:
 # ==========================
 @dataclass
 class Config:
-    BOT_VERSION: str = "v297"   # [FIX-v297-BUG] аудит: score/ticker_data/_ptf_streak UnboundLocal+NameError, impulse_alive/changes_text NameError, усреднение мимо exposure, UTC/local hour, orderLinkId, малые выборки в brain, hardcoded секреты
+    BOT_VERSION: str = "v298"   # [FIX-v298-BUG] ORDER_COUNT: пол >=2 закрыт во всех точках (apply_mode/activity_profile/dynamic_order_count/_dynamic_usdt_per_order/AOS-фолбэки/build_grid._max_possible/Telegram /set orders/learned_cfg restore) + [FIX-v297-BUG] аудит v296: score/ticker_data/_ptf_streak UnboundLocal+NameError, impulse_alive/changes_text NameError, усреднение мимо exposure, UTC/local hour, orderLinkId, малые выборки в brain, hardcoded секреты
 
     # ════════════════════════════════════════════════════════
     # 🔑  ТВОИ КЛЮЧИ — ПРОСТО ВСТАВЬ СЮДА (не менять ничего другого)
@@ -2874,7 +2910,10 @@ def apply_mode(mode_name: str) -> str:
 
     # [NEW-v138-2] SNIPER: применяем расширенный набор параметров реально в CFG
     if mode_name == "SNIPER":
-        CFG.ORDER_COUNT                           = p["order_count"]
+        # [FIX-v298-BUG] Было `= p["order_count"]` без ограничения снизу. Профиль сейчас
+        # всегда даёт 2, но при редактировании MODE_PROFILES/p в будущем это могло тихо
+        # опустить ORDER_COUNT до 1 и сломать усреднение (стратегия требует строго >=2).
+        CFG.ORDER_COUNT                           = max(2, int(p.get("order_count", 2) or 2))
         CFG.MIN_24H_TURNOVER_USDT                 = p["min_turnover"]
         CFG.AUTO_TURNOVER_BASE                    = p["min_turnover"]   # синхронизируем turnover floor
         CFG.AUTO_TURNOVER_MIN                     = p["min_turnover"]   # fallback тоже поднимается
@@ -3444,7 +3483,11 @@ def apply_trade_activity_mode(mode_name: str) -> str:
             'switch_improvement_pct': max(12.0, float(getattr(CFG, 'SWITCH_IMPROVEMENT_PCT', 10.0) or 10.0)),
             'no_trade_relax_after_min': max(35.0, float(getattr(CFG, 'NO_TRADE_RELAX_AFTER_MIN', 45) or 45)),
             'scanner_precheck_top_n': max(3, int(getattr(CFG, 'SCANNER_PRECHECK_TOP_N', 5) or 5)),
-            'order_count_cap': max(1, min(2, int(getattr(CFG, 'ORDER_COUNT', 3) or 3))),
+            # [FIX-v298-BUG] Было max(1, min(2,...)) — при ORDER_COUNT=1 (например, из-за
+            # другого не-заклампленного места) cap схлопывался до 1 → dynamic_order_count()
+            # мог вернуть 1 ордер в "conservative" профиле. Пол поднят до 2 (стратегия
+            # требует строго >=2 ордеров для усреднения).
+            'order_count_cap': max(2, min(2, int(getattr(CFG, 'ORDER_COUNT', 2) or 2))),
             'ai_min_adj': 0.30,
             'entry_threshold': float(getattr(CFG, 'ENTRY_THRESHOLD_CONSERVATIVE', 5.0) or 5.0),
         },
@@ -3455,7 +3498,9 @@ def apply_trade_activity_mode(mode_name: str) -> str:
             'switch_improvement_pct': float(getattr(CFG, 'SWITCH_IMPROVEMENT_PCT', 10.0) or 10.0),
             'no_trade_relax_after_min': float(getattr(CFG, 'NO_TRADE_RELAX_AFTER_MIN', 45) or 45),
             'scanner_precheck_top_n': int(getattr(CFG, 'SCANNER_PRECHECK_TOP_N', 5) or 5),
-            'order_count_cap': max(1, min(3, int(getattr(CFG, 'ORDER_COUNT', 3) or 3))),
+            # [FIX-v298-BUG] Было max(1, min(3,...)) — floor поднят до 2, см. комментарий
+            # в 'conservative' профиле выше.
+            'order_count_cap': max(2, min(3, int(getattr(CFG, 'ORDER_COUNT', 2) or 2))),
             'ai_min_adj': 0.0,
             'entry_threshold': float(getattr(CFG, 'ENTRY_THRESHOLD_BALANCED', 3.5) or 3.5),
         },
@@ -7657,9 +7702,14 @@ class Engine:
             return True, "guard error -> allow"
     def dynamic_order_count(self) -> int:
         """Динамическое число BUY ордеров по ATR% и TRADE_ACTIVITY_MODE."""
-        cap = max(1, min(3, int(self._activity_profile().get('order_count_cap', CFG.ORDER_COUNT) or CFG.ORDER_COUNT)))
+        # [FIX-v298-BUG] Было max(1, ...) в трёх местах этого метода — стратегия построена
+        # на СТРОГО >=2 ордерах (усреднение), а build_grid() полагается на то, что этот метод
+        # уже не даёт 1. Раньше это подстраховывалось только downstream floor'ом в build_grid
+        # (v291-1), но здесь сам метод мог вернуть 1 при 'conservative'/малом ORDER_COUNT —
+        # несогласованность каждый раз, когда результат читался НЕ через build_grid.
+        cap = max(2, min(3, int(self._activity_profile().get('order_count_cap', CFG.ORDER_COUNT) or CFG.ORDER_COUNT)))
         if not bool(getattr(CFG, 'DYNAMIC_ORDERS', False)):
-            return max(1, min(cap, int(CFG.ORDER_COUNT)))
+            return max(2, min(cap, int(CFG.ORDER_COUNT)))
         try:
             atr = float(self.atr_pct(interval_min=str(CFG.KLINE_INTERVAL_MIN), period=14, limit=60))
         except Exception:
@@ -7671,7 +7721,7 @@ class Engine:
             base = min(base, 2)
         elif mode == 'active' and atr >= high_atr * 0.8:
             base = 3
-        return max(1, min(cap, base))
+        return max(2, min(cap, base))  # [FIX-v298-BUG] было max(1, ...)
     @staticmethod
     def calc_real_adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
         """
@@ -9172,15 +9222,26 @@ class Engine:
             _real_bal = float(self.get_usdt_balance() or 0.0)
             _bal = _real_bal + self._current_exposure_usdt()
             _max_pct = float(getattr(CFG, 'MAX_SINGLE_COIN_EXPOSURE_PCT', 60.0))
-            _n_orders = max(1, int(getattr(CFG, 'ORDER_COUNT', 3)))
+            # [FIX-v298-BUG] Было max(1, ...) — если CFG.ORDER_COUNT где-то временно равен 1
+            # (напр. через AOS_ORDERS_UNDER_50 с дефолтом 1 ниже), бюджет на ордер делился на 1
+            # (то есть удваивался), а build_grid() всё равно строит МИНИМУМ 2 ордера (v291-1) —
+            # итог: 2 ордера по удвоенному размеру = скрытое превышение запланированной
+            # экспозиции. Пол поднят до 2, синхронно со стратегией "строго 2 ордера".
+            _n_orders = max(2, int(getattr(CFG, 'ORDER_COUNT', 2)))
             _dynamic = (_bal * _max_pct / 100.0) / _n_orders
             _min_order = float(getattr(CFG, 'MIN_USDT_PER_ORDER', 5.0))
             _cfg_max = float(getattr(CFG, 'USDT_PER_ORDER', 7.5))
             # [FIX-v264-2] АВТО-РАСПРЕДЕЛЕНИЕ БАЛАНСА (настройки в CFG.AOS_*)
             if bool(getattr(CFG, 'AUTO_ORDER_SIZING', False)) and _real_bal > 0:
+                # [FIX-v298-BUG] AOS_ORDERS_UNDER_50 фолбэк был 1 (несогласован с реальным
+                # дефолтом в Config, который =2) — при балансе <50 USDT (самый частый случай
+                # в этом файле, все примеры про депозит $25) это давало _n=1, откуда:
+                # (а) _per_order считался как budget/1 — вдвое больше положенного, И
+                # (б) CFG.ORDER_COUNT = min(2, 1) = 1 ниже — гарантированный обход стратегии
+                # "строго 2 ордера для усреднения". Фолбэки всех ступеней подняты до 2.
                 if   _real_bal < 50:
                     _pct = float(getattr(CFG, 'AOS_PCT_UNDER_50', 0.40))
-                    _n = int(getattr(CFG, 'AOS_ORDERS_UNDER_50', 1))
+                    _n = int(getattr(CFG, 'AOS_ORDERS_UNDER_50', 2))
                 elif _real_bal < 200:
                     _pct = float(getattr(CFG, 'AOS_PCT_50_200', 0.45))
                     _n = int(getattr(CFG, 'AOS_ORDERS_50_200', 2))
@@ -9193,8 +9254,14 @@ class Engine:
                 else:
                     _pct = float(getattr(CFG, 'AOS_PCT_OVER_1000', 0.40))
                     _n = int(getattr(CFG, 'AOS_ORDERS_OVER_200', 2))
+                # [FIX-v298-BUG] Флор >=2 ДО использования _n в делении на строке ниже —
+                # раньше _n мог быть 1 (см. выше), а деление на _n происходит до guard'а
+                # ORDER_COUNT, так что старый min(2,...) guard не защищал сайзинг вообще.
+                _n = max(2, _n)
                 # Обновляем кол-во ордеров под баланс
-                CFG.ORDER_COUNT = min(2, int(_n))  # [v287-3] GUARD: строго max=2, Telegram /set orders защищён
+                # [v287-3+v298] строго 2: сохранён исходный потолок max=2 (стратегия не
+                # рассчитана на 3+ ордера здесь) И добавлен пол >=2 (см. правку _n выше).
+                CFG.ORDER_COUNT = max(2, min(2, int(_n)))
                 _per_order = max(_min_order, round(_real_bal * _pct / _n, 2))
                 log(f"💡 [v264-2] Авто-размер: баланс {_real_bal:.1f}×{_pct:.0%}÷{_n} ордеров = {_per_order:.2f} USDT/ордер")
                 return _per_order
@@ -14990,8 +15057,12 @@ class Engine:
             if key == "orders":
                 try:
                     x = int(val)
-                    if x < 1 or x > 3:
-                        ok("orders: 1, 2 или 3")
+                    # [FIX-v298-BUG] Было `x < 1`, то есть /set orders 1 разрешал ORDER_COUNT=1,
+                    # хотя вся стратегия усреднения по всему файлу требует СТРОГО >=2 ордеров
+                    # (build_grid и так принудительно строит минимум 2 — v291-1 — но ORDER_COUNT=1
+                    # искажал сайзинг ордера в _dynamic_usdt_per_order() до починки в v298).
+                    if x < 2 or x > 3:
+                        ok("orders: 2 или 3 (1 запрещён — стратегия требует минимум 2 ордера для усреднения)")
                         return
                     CFG.ORDER_COUNT = x
                     ok(f"ORDER_COUNT = {x}")
@@ -16086,7 +16157,15 @@ class Engine:
             # [FIX-v244-3] Минимальный резерв 2 USDT на непредвиденное
             _min_reserve_usdt = 2.0
             _pre_avail_adj = max(0.0, _pre_avail - _min_reserve_usdt)
-            _max_possible = max(1, int(_pre_avail * _reserve_factor / max(_dyn_order_usdt, 0.01)))
+            # [FIX-v298-BUG] Было max(1, ...) — при низком балансе это тихо откатывало
+            # order_count до 1 ПОСЛЕ того, как строкой выше уже был применён floor "строго
+            # не меньше 2" (v291-1), полностью отменяя защиту от одиночного (без усреднения)
+            # входа именно в сценарии "баланс мал / размер ордера велик", т.е. ровно там, где
+            # усреднение нужнее всего. Реальная проверка "хватает ли денег на КАЖДЫЙ конкретный
+            # ордер" всё равно происходит внутри place_limit_buy() на каждой итерации ниже —
+            # этот пре-чек лишь предсказывает ожидаемое количество, поэтому floor=2 здесь
+            # ничем не рискует (недостаточно денег на 2-й ордер просто пропустит его сам цикл).
+            _max_possible = max(2, int(_pre_avail * _reserve_factor / max(_dyn_order_usdt, 0.01)))
             if _max_possible < order_count:
                 log(f"💡 [v234-3] Баланс {_pre_avail:.2f} USDT → максимум {_max_possible} ордер(а) из {order_count} запрошенных")
                 order_count = _max_possible
@@ -16431,7 +16510,11 @@ class Engine:
         try:
             self._clamp_filters_to_strict_floor()
             # ORDER_COUNT строго 2 (мозг мог восстановить 3 из старого файла)
-            CFG.ORDER_COUNT = min(2, int(getattr(CFG, 'ORDER_COUNT', 2)))  # [v283-4] min(2,...) guard
+            # [FIX-v298-BUG] Старый `min(2, ...)` ("[v283-4] min(2,...) guard") на самом деле
+            # был только ПОТОЛКОМ (не даёт больше 2), но не полом — если бы learned_cfg/старый
+            # файл содержал ORDER_COUNT=1, эта строка оставила бы его 1. Комментарий вводил в
+            # заблуждение относительно того, что реально делает min(). Добавлен настоящий пол.
+            CFG.ORDER_COUNT = max(2, min(2, int(getattr(CFG, 'ORDER_COUNT', 2))))  # [v283-4+v298] пол И потолок = 2
             log(f"🔒 [v273-11] Строгие floor применены после restore: ADX={CFG.SCANNER_ADX_MIN:.0f}, ORDER_COUNT={CFG.ORDER_COUNT}")
         except Exception as _sf_ex:
             log(f"⚠️ [v273-11 floor] {_sf_ex}")
