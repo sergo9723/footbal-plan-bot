@@ -102,8 +102,17 @@ class AIBrainAdvisor:
     # ──────────────────────────────────────────────────────────────
     # БАЗОВЫЙ API ВЫЗОВ — всё через него
     # ──────────────────────────────────────────────────────────────
-    def _call_api(self, prompt: str, max_tokens: int = 500) -> Optional[str]:
-        """Вызов Claude API. Возвращает текст или None при ошибке."""
+    def _call_api(self, prompt: str, max_tokens: int = 500, timeout: float = 25.0) -> Optional[str]:
+        """Вызов Claude API. Возвращает текст или None при ошибке.
+
+        [FIX-v305-BUG] timeout параметр добавлен отдельно: ai_explain_loss/_run_nightly_report/
+        ai_daily_forecast/review_blacklist уже вызываются из ФОНОВЫХ потоков — им безопасен
+        полный timeout=25с. Но ai_score_symbol() и ai_analyze_entry() вызываются СИНХРОННО
+        прямо изнутри scan_market_top(), который выполняется в ТОРГОВОМ потоке (run()) — там
+        полный timeout=25с мог замораживать весь скан (а с ним — проверку позиции, стоп-лосс и
+        т.д.) на до 25 секунд на каждую подходящую монету при каждом скане. Эти два места теперь
+        передают короткий timeout (см. ниже) — то же решение, что уже применено к TG.send()/
+        /market//forecast (см. ROUND6/ROUND8)."""
         try:
             key = str(getattr(self.cfg, 'ANTHROPIC_KEY', '') or '')
             if not key or not key.startswith('sk-ant-'):
@@ -142,7 +151,7 @@ class AIBrainAdvisor:
                     'max_tokens': max_tokens,
                     'messages':   [{'role': 'user', 'content': prompt}]
                 },
-                timeout=25
+                timeout=timeout
             )
             if resp.status_code != 200:
                 self._last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
@@ -531,7 +540,9 @@ class AIBrainAdvisor:
 Ответь ТОЛЬКО JSON:
 {{"enter": true/false, "confidence": 0-100, "reason": "одна причина"}}"""
 
-            text = self._call_api(prompt, max_tokens=100)
+            # [FIX-v305-BUG] Вызывается СИНХРОННО из scan_market_top() — торговый поток.
+            # Короткий timeout, чтобы медленный/недоступный API не замораживал скан на 25с.
+            text = self._call_api(prompt, max_tokens=100, timeout=4.0)
             if not text:
                 return True  # API недоступен — не блокируем
 
@@ -1210,7 +1221,9 @@ class AIBrainAdvisor:
 Ответь ТОЛЬКО JSON:
 {{"score": число_0_15, "reason": "одна причина"}}"""
 
-            text = self._call_api(prompt, max_tokens=80)
+            # [FIX-v305-BUG] Вызывается СИНХРОННО из scan_market_top() для КАЖДОЙ монеты со
+            # score>=6.0 в скане (торговый поток) — короткий timeout вместо 25с по умолчанию.
+            text = self._call_api(prompt, max_tokens=80, timeout=4.0)
             if not text:
                 return base_score, "api_unavailable"
 
