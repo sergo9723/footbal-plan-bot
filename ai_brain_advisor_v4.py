@@ -307,78 +307,84 @@ class AIBrainAdvisor:
             applied_changes = []
 
             if confidence >= 65:
-                # ADX_MIN — только повышаем, не понижаем слишком агрессивно
-                new_adx = changes.get('SCANNER_ADX_MIN')
-                if new_adx is not None:
-                    cur = float(getattr(self.cfg, 'SCANNER_ADX_MIN', 25))
-                    new_adx = float(new_adx)
-                    # Ограничения безопасности
-                    new_adx = max(12.0, min(35.0, new_adx))
-                    if abs(new_adx - cur) >= 1.0:
-                        self.cfg.SCANNER_ADX_MIN = new_adx
-                        self.cfg.ADX_MIN = new_adx
-                        # [FIX-v251-6] При ИИ-повышении ADX помечаем НЕ ослабленным
-                        # Иначе apply_mode при рестарте снизит ADX до профильного
-                        self.cfg._filter_relaxed_by_brain = False  # ИИ повысил — это ужесточение
-                        applied_changes.append(f"ADX_MIN {cur:.0f}→{new_adx:.0f}")
-                        # Сохраняем в learned_cfg
-                        self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = new_adx
+                # [FIX-v314-BUG] Этот метод выполняется в фоновом потоке (см. ai_explain_loss
+                # выше — threading.Thread), а self.knowledge._data одновременно читает/пишет
+                # главный торговый поток. Без общей блокировки json.dump() в _save() может
+                # упасть посреди итерации, если в этот момент сюда добавляется элемент
+                # (см. лок в BotKnowledge.__init__/_save(), spot_bot).
+                with self.knowledge._lock:
+                    # ADX_MIN — только повышаем, не понижаем слишком агрессивно
+                    new_adx = changes.get('SCANNER_ADX_MIN')
+                    if new_adx is not None:
+                        cur = float(getattr(self.cfg, 'SCANNER_ADX_MIN', 25))
+                        new_adx = float(new_adx)
+                        # Ограничения безопасности
+                        new_adx = max(12.0, min(35.0, new_adx))
+                        if abs(new_adx - cur) >= 1.0:
+                            self.cfg.SCANNER_ADX_MIN = new_adx
+                            self.cfg.ADX_MIN = new_adx
+                            # [FIX-v251-6] При ИИ-повышении ADX помечаем НЕ ослабленным
+                            # Иначе apply_mode при рестарте снизит ADX до профильного
+                            self.cfg._filter_relaxed_by_brain = False  # ИИ повысил — это ужесточение
+                            applied_changes.append(f"ADX_MIN {cur:.0f}→{new_adx:.0f}")
+                            # Сохраняем в learned_cfg
+                            self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = new_adx
 
-                # RSI диапазон
-                new_rsi_min = changes.get('SCANNER_RSI_MIN')
-                if new_rsi_min is not None:
-                    cur = float(getattr(self.cfg, 'SCANNER_RSI_MIN', 35))
-                    new_rsi_min = max(18.0, min(45.0, float(new_rsi_min)))
-                    if abs(new_rsi_min - cur) >= 1.0:
-                        self.cfg.SCANNER_RSI_MIN = new_rsi_min
-                        applied_changes.append(f"RSI_MIN {cur:.0f}→{new_rsi_min:.0f}")
-                        self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = new_rsi_min
+                    # RSI диапазон
+                    new_rsi_min = changes.get('SCANNER_RSI_MIN')
+                    if new_rsi_min is not None:
+                        cur = float(getattr(self.cfg, 'SCANNER_RSI_MIN', 35))
+                        new_rsi_min = max(18.0, min(45.0, float(new_rsi_min)))
+                        if abs(new_rsi_min - cur) >= 1.0:
+                            self.cfg.SCANNER_RSI_MIN = new_rsi_min
+                            applied_changes.append(f"RSI_MIN {cur:.0f}→{new_rsi_min:.0f}")
+                            self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = new_rsi_min
 
-                new_rsi_max = changes.get('SCANNER_RSI_MAX')
-                if new_rsi_max is not None:
-                    cur = float(getattr(self.cfg, 'SCANNER_RSI_MAX', 65))
-                    new_rsi_max = max(55.0, min(75.0, float(new_rsi_max)))
-                    if abs(new_rsi_max - cur) >= 1.0:
-                        self.cfg.SCANNER_RSI_MAX = new_rsi_max
-                        applied_changes.append(f"RSI_MAX {cur:.0f}→{new_rsi_max:.0f}")
+                    new_rsi_max = changes.get('SCANNER_RSI_MAX')
+                    if new_rsi_max is not None:
+                        cur = float(getattr(self.cfg, 'SCANNER_RSI_MAX', 65))
+                        new_rsi_max = max(55.0, min(75.0, float(new_rsi_max)))
+                        if abs(new_rsi_max - cur) >= 1.0:
+                            self.cfg.SCANNER_RSI_MAX = new_rsi_max
+                            applied_changes.append(f"RSI_MAX {cur:.0f}→{new_rsi_max:.0f}")
 
-                # Плохие часы
-                add_hours = changes.get('avoid_hours_add', [])
-                if add_hours and isinstance(add_hours, list):
-                    cur_bad = list(self.knowledge._data.get('bad_hours', []))
-                    added = []
-                    for h in add_hours:
-                        h = int(h)
-                        if h not in cur_bad and len(cur_bad) < 12:
-                            cur_bad.append(h)
-                            added.append(h)
-                    if added:
-                        self.knowledge._data['bad_hours'] = cur_bad
-                        applied_changes.append(f"bad_hours +{added}")
+                    # Плохие часы
+                    add_hours = changes.get('avoid_hours_add', [])
+                    if add_hours and isinstance(add_hours, list):
+                        cur_bad = list(self.knowledge._data.get('bad_hours', []))
+                        added = []
+                        for h in add_hours:
+                            h = int(h)
+                            if h not in cur_bad and len(cur_bad) < 12:
+                                cur_bad.append(h)
+                                added.append(h)
+                        if added:
+                            self.knowledge._data['bad_hours'] = cur_bad
+                            applied_changes.append(f"bad_hours +{added}")
 
-                # MIN_SCORE
-                new_score = changes.get('MIN_SCORE_TO_ENTER')
-                if new_score is not None:
-                    cur = float(getattr(self.cfg, 'MIN_SCORE_TO_ENTER', 4.5))
-                    new_score = max(3.0, min(7.0, float(new_score)))
-                    if abs(new_score - cur) >= 0.3:
-                        self.cfg.MIN_SCORE_TO_ENTER = new_score
-                        applied_changes.append(f"MIN_SCORE {cur:.1f}→{new_score:.1f}")
+                    # MIN_SCORE
+                    new_score = changes.get('MIN_SCORE_TO_ENTER')
+                    if new_score is not None:
+                        cur = float(getattr(self.cfg, 'MIN_SCORE_TO_ENTER', 4.5))
+                        new_score = max(3.0, min(7.0, float(new_score)))
+                        if abs(new_score - cur) >= 0.3:
+                            self.cfg.MIN_SCORE_TO_ENTER = new_score
+                            applied_changes.append(f"MIN_SCORE {cur:.1f}→{new_score:.1f}")
 
-                # Сохраняем изменения
-                if applied_changes:
-                    self.knowledge._data.setdefault('ai_learning_log', []).append({
-                        'ts':       datetime.now().isoformat(),
-                        'type':     'loss_analysis',
-                        'symbol':   trade.get('symbol'),
-                        'pnl':      trade.get('pnl_usdt'),
-                        'changes':  applied_changes,
-                        'diagnosis': diagnosis,
-                        'confidence': confidence,
-                    })
-                    self.knowledge._data['ai_learning_log'] = \
-                        self.knowledge._data['ai_learning_log'][-100:]
-                    self.knowledge._save()
+                    # Сохраняем изменения
+                    if applied_changes:
+                        self.knowledge._data.setdefault('ai_learning_log', []).append({
+                            'ts':       datetime.now().isoformat(),
+                            'type':     'loss_analysis',
+                            'symbol':   trade.get('symbol'),
+                            'pnl':      trade.get('pnl_usdt'),
+                            'changes':  applied_changes,
+                            'diagnosis': diagnosis,
+                            'confidence': confidence,
+                        })
+                        self.knowledge._data['ai_learning_log'] = \
+                            self.knowledge._data['ai_learning_log'][-100:]
+                        self.knowledge._save()
 
             # Отправляем в Telegram
             if self.tg and getattr(self.tg, 'enabled', False):
@@ -718,85 +724,89 @@ class AIBrainAdvisor:
             MIN_CONFIDENCE = 60
 
             if confidence >= MIN_CONFIDENCE:
-                # ADX
-                v = changes.get('SCANNER_ADX_MIN')
-                if v:
-                    cur = float(getattr(self.cfg, 'SCANNER_ADX_MIN', 25))
-                    v = max(12.0, min(40.0, float(v)))
-                    if abs(v - cur) >= 1.0:
-                        self.cfg.SCANNER_ADX_MIN = v
-                        self.cfg.ADX_MIN = v
-                        applied.append(f"ADX_MIN {cur:.0f}→{v:.0f}")
-                        self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = v
+                # [FIX-v314-BUG] Фоновый поток (см. check_nightly_report — threading.Thread)
+                # мутирует self.knowledge._data параллельно с главным торговым потоком —
+                # тот же лок, что и в _apply_loss_analysis, см. комментарий там же.
+                with self.knowledge._lock:
+                    # ADX
+                    v = changes.get('SCANNER_ADX_MIN')
+                    if v:
+                        cur = float(getattr(self.cfg, 'SCANNER_ADX_MIN', 25))
+                        v = max(12.0, min(40.0, float(v)))
+                        if abs(v - cur) >= 1.0:
+                            self.cfg.SCANNER_ADX_MIN = v
+                            self.cfg.ADX_MIN = v
+                            applied.append(f"ADX_MIN {cur:.0f}→{v:.0f}")
+                            self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = v
 
-                # RSI
-                v = changes.get('SCANNER_RSI_MIN')
-                if v:
-                    cur = float(getattr(self.cfg, 'SCANNER_RSI_MIN', 35))
-                    v = max(18.0, min(45.0, float(v)))
-                    if abs(v - cur) >= 1.0:
-                        self.cfg.SCANNER_RSI_MIN = v
-                        applied.append(f"RSI_MIN {cur:.0f}→{v:.0f}")
-                        self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = v
+                    # RSI
+                    v = changes.get('SCANNER_RSI_MIN')
+                    if v:
+                        cur = float(getattr(self.cfg, 'SCANNER_RSI_MIN', 35))
+                        v = max(18.0, min(45.0, float(v)))
+                        if abs(v - cur) >= 1.0:
+                            self.cfg.SCANNER_RSI_MIN = v
+                            applied.append(f"RSI_MIN {cur:.0f}→{v:.0f}")
+                            self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = v
 
-                v = changes.get('SCANNER_RSI_MAX')
-                if v:
-                    cur = float(getattr(self.cfg, 'SCANNER_RSI_MAX', 65))
-                    v = max(55.0, min(78.0, float(v)))
-                    if abs(v - cur) >= 1.0:
-                        self.cfg.SCANNER_RSI_MAX = v
-                        applied.append(f"RSI_MAX {cur:.0f}→{v:.0f}")
+                    v = changes.get('SCANNER_RSI_MAX')
+                    if v:
+                        cur = float(getattr(self.cfg, 'SCANNER_RSI_MAX', 65))
+                        v = max(55.0, min(78.0, float(v)))
+                        if abs(v - cur) >= 1.0:
+                            self.cfg.SCANNER_RSI_MAX = v
+                            applied.append(f"RSI_MAX {cur:.0f}→{v:.0f}")
 
-                # SL
-                v = changes.get('STOP_LOSS_PCT')
-                if v:
-                    cur = float(getattr(self.cfg, 'STOP_LOSS_PCT', 1.2))
-                    v = max(0.7, min(2.0, float(v)))
-                    if abs(v - cur) >= 0.05:
-                        self.cfg.STOP_LOSS_PCT = v
-                        # [FIX-v252-1] Сохраняем в learned_cfg — переживёт рестарт
-                        self.knowledge._data.setdefault('learned_cfg', {})['STOP_LOSS_PCT'] = v
-                        applied.append(f"SL {cur:.2f}%→{v:.2f}%")
+                    # SL
+                    v = changes.get('STOP_LOSS_PCT')
+                    if v:
+                        cur = float(getattr(self.cfg, 'STOP_LOSS_PCT', 1.2))
+                        v = max(0.7, min(2.0, float(v)))
+                        if abs(v - cur) >= 0.05:
+                            self.cfg.STOP_LOSS_PCT = v
+                            # [FIX-v252-1] Сохраняем в learned_cfg — переживёт рестарт
+                            self.knowledge._data.setdefault('learned_cfg', {})['STOP_LOSS_PCT'] = v
+                            applied.append(f"SL {cur:.2f}%→{v:.2f}%")
 
-                # TIME_STOP
-                v = changes.get('TIME_STOP_HOURS')
-                if v:
-                    cur = float(getattr(self.cfg, 'TIME_STOP_HOURS', 1.0))
-                    v = max(0.5, min(4.0, float(v)))
-                    if abs(v - cur) >= 0.1:
-                        self.cfg.TIME_STOP_HOURS = v
-                        # [FIX-v252-1] Сохраняем в learned_cfg — переживёт рестарт
-                        self.knowledge._data.setdefault('learned_cfg', {})['TIME_STOP_HOURS'] = v
-                        applied.append(f"TimeStop {cur:.1f}→{v:.1f}ч")
+                    # TIME_STOP
+                    v = changes.get('TIME_STOP_HOURS')
+                    if v:
+                        cur = float(getattr(self.cfg, 'TIME_STOP_HOURS', 1.0))
+                        v = max(0.5, min(4.0, float(v)))
+                        if abs(v - cur) >= 0.1:
+                            self.cfg.TIME_STOP_HOURS = v
+                            # [FIX-v252-1] Сохраняем в learned_cfg — переживёт рестарт
+                            self.knowledge._data.setdefault('learned_cfg', {})['TIME_STOP_HOURS'] = v
+                            applied.append(f"TimeStop {cur:.1f}→{v:.1f}ч")
 
-                # MIN_SCORE
-                v = changes.get('MIN_SCORE_TO_ENTER')
-                if v:
-                    cur = float(getattr(self.cfg, 'MIN_SCORE_TO_ENTER', 4.5))
-                    v = max(2.5, min(8.0, float(v)))
-                    if abs(v - cur) >= 0.2:
-                        self.cfg.MIN_SCORE_TO_ENTER = v
-                        applied.append(f"MinScore {cur:.1f}→{v:.1f}")
+                    # MIN_SCORE
+                    v = changes.get('MIN_SCORE_TO_ENTER')
+                    if v:
+                        cur = float(getattr(self.cfg, 'MIN_SCORE_TO_ENTER', 4.5))
+                        v = max(2.5, min(8.0, float(v)))
+                        if abs(v - cur) >= 0.2:
+                            self.cfg.MIN_SCORE_TO_ENTER = v
+                            applied.append(f"MinScore {cur:.1f}→{v:.1f}")
 
-                # Bad hours — полная замена
-                new_bad = changes.get('bad_hours_set')
-                if new_bad and isinstance(new_bad, list):
-                    new_bad = [int(h) for h in new_bad[:8]]  # макс 8 часов
-                    self.knowledge._data['bad_hours'] = new_bad
-                    applied.append(f"bad_hours={new_bad}")
+                    # Bad hours — полная замена
+                    new_bad = changes.get('bad_hours_set')
+                    if new_bad and isinstance(new_bad, list):
+                        new_bad = [int(h) for h in new_bad[:8]]  # макс 8 часов
+                        self.knowledge._data['bad_hours'] = new_bad
+                        applied.append(f"bad_hours={new_bad}")
 
-                # Сохраняем
-                if applied:
-                    self.knowledge._data.setdefault('ai_learning_log', []).append({
-                        'ts':       datetime.now().isoformat(),
-                        'type':     'nightly_report',
-                        'changes':  applied,
-                        'confidence': confidence,
-                        'summary':  summary,
-                    })
-                    self.knowledge._data['ai_learning_log'] = \
-                        self.knowledge._data['ai_learning_log'][-100:]
-                    self.knowledge._save()
+                    # Сохраняем
+                    if applied:
+                        self.knowledge._data.setdefault('ai_learning_log', []).append({
+                            'ts':       datetime.now().isoformat(),
+                            'type':     'nightly_report',
+                            'changes':  applied,
+                            'confidence': confidence,
+                            'summary':  summary,
+                        })
+                        self.knowledge._data['ai_learning_log'] = \
+                            self.knowledge._data['ai_learning_log'][-100:]
+                        self.knowledge._save()
 
             # Telegram отчёт
             if self.tg and getattr(self.tg, 'enabled', False):
@@ -1146,12 +1156,28 @@ class AIBrainAdvisor:
             if not to_unblock:
                 return
 
-            # Убираем из banned_coins.json
-            new_banned = [s for s in banned if s not in to_unblock]
-            new_reasons = {k: v for k, v in reasons.items() if k not in to_unblock}
+            # [FIX-v314-BUG] TOCTOU: между чтением файла (строка выше) и этой записью
+            # прошёл вызов Claude API (до ~25с) — за это время основной торговый поток мог
+            # добавить НОВЫЙ перманентный бан (аварийный выход по другой монете, см.
+            # _add_to_permanent_emergency_blacklist в spot_bot). Запись здесь раньше
+            # использовала СТАРЫЙ снимок banned/reasons, прочитанный ДО API-вызова — свежий
+            # бан, добавленный за это время, в снимке отсутствовал и полностью пропадал из
+            # файла при перезаписи (то есть монету только что забаненную заново — тихо
+            # разбанивало, никак не связано с решением ИИ по НЕЙ). Перед записью перечитываем
+            # файл заново и убираем из СВЕЖИХ данных только то, что реально разрешил ИИ.
+            try:
+                with open(bl_file, 'r') as f:
+                    _fresh_bl = json.load(f)
+            except Exception:
+                _fresh_bl = bl_data
+            fresh_banned = _fresh_bl.get('banned', [])
+            fresh_reasons = _fresh_bl.get('reasons', {})
+            fresh_blocked_since = _fresh_bl.get('blocked_since', blocked_since)
+            new_banned = [s for s in fresh_banned if s not in to_unblock]
+            new_reasons = {k: v for k, v in fresh_reasons.items() if k not in to_unblock}
             with open(bl_file, 'w') as f:
                 json.dump({'banned': sorted(new_banned), 'reasons': new_reasons,
-                           'blocked_since': blocked_since}, f, indent=2)
+                           'blocked_since': fresh_blocked_since}, f, indent=2)
 
             # Лог и TG
             log_func = self.knowledge._data.get('_log_func')
@@ -1161,13 +1187,16 @@ class AIBrainAdvisor:
                    f"Причина: {reason_txt}")
             if self.tg and getattr(self.tg, 'enabled', False):
                 self.tg.send(msg)
-            self.knowledge._data.setdefault('ai_learning_log', []).append({
-                'ts': __import__('datetime').datetime.now().isoformat(),
-                'type': 'blacklist_review',
-                'unblocked': to_unblock,
-                'reason': reason_txt,
-            })
-            self.knowledge._save()
+            # [FIX-v314-BUG] Тот же лок, что и в _apply_loss_analysis/_run_nightly_report —
+            # этот метод тоже фоновый поток (см. review_blacklist — threading.Thread).
+            with self.knowledge._lock:
+                self.knowledge._data.setdefault('ai_learning_log', []).append({
+                    'ts': __import__('datetime').datetime.now().isoformat(),
+                    'type': 'blacklist_review',
+                    'unblocked': to_unblock,
+                    'reason': reason_txt,
+                })
+                self.knowledge._save()
 
         except Exception as e:
             pass  # тихо — не мешаем торговле
