@@ -326,6 +326,21 @@ class AIBrainAdvisor:
                             # [FIX-v251-6] При ИИ-повышении ADX помечаем НЕ ослабленным
                             # Иначе apply_mode при рестарте снизит ADX до профильного
                             self.cfg._filter_relaxed_by_brain = False  # ИИ повысил — это ужесточение
+                            # [FIX-v325-BUG] Комментарий выше (FIX-v251-6) предполагал, что
+                            # _filter_relaxed_by_brain=False убережёт это ужесточение от
+                            # apply_mode() — но НЕ убережёт: apply_mode() (spot_bot.py) при
+                            # _relaxed=False безусловно перезаписывает SCANNER_ADX_MIN
+                            # значением профиля режима, стирая именно то повышение, которое
+                            # мы только что применили, при самом первом же apply_mode() (это
+                            # рутинное, частое событие — полуночный сброс, смена режима).
+                            # min()/max()-защита в apply_mode() устроена ТОЛЬКО для сохранения
+                            # ослабления (мягче), а не ужесточения (строже) — противоположное
+                            # направление не защищено вовсе. Теперь явный "пол" от ИИ,
+                            # который apply_mode() (после фикса там же) не даст опустить ниже,
+                            # с автораспадом через 24ч.
+                            if new_adx > cur:
+                                self.cfg._ai_adx_floor = new_adx
+                                self.cfg._ai_adx_floor_ts = time.time()
                             applied_changes.append(f"ADX_MIN {cur:.0f}→{new_adx:.0f}")
                             # Сохраняем в learned_cfg
                             self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = new_adx
@@ -455,20 +470,28 @@ class AIBrainAdvisor:
                     'pnl': trade.get('pnl_usdt'),
                 }
             }
-            self.knowledge._data['win_profile'] = win_profile
+            # [FIX-v325-BUG] Остальные 3 фоновых мутатора (_apply_loss_analysis/
+            # _run_nightly_report/_run_blacklist_review) оборачивают мутации self.knowledge.
+            # _data в self.knowledge._lock — этот метод, хоть и вызывается синхронно из
+            # главного торгового потока (не фоновым потоком), мутирует те же самые вложенные
+            # структуры (symbol_stats и т.д.), которые фоновые ИИ-потоки могут мутировать в
+            # этот же момент под локом. Без общего лока здесь эта защита однобокая — для
+            # консистентности с остальными тремя мутаторами.
+            with self.knowledge._lock:
+                self.knowledge._data['win_profile'] = win_profile
 
-            # Помечаем хорошие монеты (повышаем доверие в symbol_stats)
-            try:
-                sym = trade.get('symbol', '')
-                if sym:
-                    ss = self.knowledge._data.setdefault('symbol_stats', {}).setdefault(sym, {})
-                    ss['wins'] = ss.get('wins', 0) + 1
-                    ss['last_win_adx'] = trade.get('adx')
-                    ss['last_win_rsi'] = trade.get('rsi')
-            except Exception:
-                pass
+                # Помечаем хорошие монеты (повышаем доверие в symbol_stats)
+                try:
+                    sym = trade.get('symbol', '')
+                    if sym:
+                        ss = self.knowledge._data.setdefault('symbol_stats', {}).setdefault(sym, {})
+                        ss['wins'] = ss.get('wins', 0) + 1
+                        ss['last_win_adx'] = trade.get('adx')
+                        ss['last_win_rsi'] = trade.get('rsi')
+                except Exception:
+                    pass
 
-            self.knowledge._save()
+                self.knowledge._save()
 
             # Лог: при каких условиях получили профит
             try:
@@ -648,7 +671,13 @@ class AIBrainAdvisor:
                     adx_stat.append(f"{k}:WR={a_wr:.0f}%(n={v['trades']})")
 
             # Топ убыточных монет
-            sym_stats = self.knowledge._data.get('learned_cfg', {}).get('symbol_stats', {})
+            # [FIX-v325-BUG] Было self.knowledge._data.get('learned_cfg', {}).get('symbol_stats', {})
+            # — это СНИМОК symbol_stats, который spot_bot.py копирует внутрь learned_cfg только
+            # внутри apply_learning() при applied непустом (нерегулярно, могло не обновляться
+            # часами/днями) — а не живой, актуальный self.knowledge._data['symbol_stats'],
+            # который обновляется на КАЖДОЙ сделке (см. [FIX-v240-2] в spot_bot.py). Из-за этого
+            # "ТОП УБЫТОЧНЫХ МОНЕТ" в ночном отчёте мог показывать устаревшую картину.
+            sym_stats = self.knowledge._data.get('symbol_stats', {})
             worst_sym = sorted(
                 [(s, d) for s, d in sym_stats.items() if d.get('trades', 0) >= 2],
                 key=lambda x: x[1]['pnl']
@@ -736,6 +765,11 @@ class AIBrainAdvisor:
                         if abs(v - cur) >= 1.0:
                             self.cfg.SCANNER_ADX_MIN = v
                             self.cfg.ADX_MIN = v
+                            # [FIX-v325-BUG] См. тот же фикс в _apply_loss_analysis — без
+                            # этого "пола" ужесточение ADX_MIN стирается первым же apply_mode().
+                            if v > cur:
+                                self.cfg._ai_adx_floor = v
+                                self.cfg._ai_adx_floor_ts = time.time()
                             applied.append(f"ADX_MIN {cur:.0f}→{v:.0f}")
                             self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_ADX_MIN'] = v
 
@@ -762,6 +796,17 @@ class AIBrainAdvisor:
                     if v:
                         cur = float(getattr(self.cfg, 'STOP_LOSS_PCT', 1.2))
                         v = max(0.7, min(2.0, float(v)))
+                        # [FIX-v325-BUG] КРИТИЧНО: spot_bot.py считает STOP_LOSS_PCT < HARD_EXIT_
+                        # LOSS_PCT незыблемым инвариантом ("HARD_EXIT ДОЛЖЕН быть > STOP_LOSS",
+                        # см. [v285-2] в Config, и [v287-2] SL_MAX GUARD — тот же самый паттерн,
+                        # который здесь отсутствовал). Диапазон выше (0.7-2.0%) не проверялся
+                        # против HARD_EXIT_LOSS_PCT (по умолчанию 0.9%) — ночной отчёт мог
+                        # поднять STOP_LOSS_PCT ВЫШЕ или вплотную к HARD_EXIT, из-за чего
+                        # stop_loss фактически переставал успевать сработать раньше hard-exit/
+                        # full_grid_early_stop, ломая порядок срабатывания защит, на который
+                        # рассчитан остальной код. Теперь тот же SL_MAX GUARD, что и в v287-2.
+                        _hard_exit = float(getattr(self.cfg, 'HARD_EXIT_LOSS_PCT', 0.9))
+                        v = min(v, round(_hard_exit - 0.05, 2))
                         if abs(v - cur) >= 0.05:
                             self.cfg.STOP_LOSS_PCT = v
                             # [FIX-v252-1] Сохраняем в learned_cfg — переживёт рестарт
