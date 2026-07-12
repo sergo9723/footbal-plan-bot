@@ -939,8 +939,15 @@ class AIBrainAdvisor:
                 return False
             with open(path) as f:
                 data = json.load(f)
+            # [FIX-aux-CRITICAL] Проверил реальный исходный код news_bot.py — он никогда не
+            # пишет ключи 'market_blocked'/'global_block', только 'panic' (bool). Значит эта
+            # проверка была ВСЕГДА False, независимо от реальной паники на рынке — притом что
+            # news_bot.py сам явно обещает в своём TG-сообщении при панике: "v186 и smc_bot
+            # автоматически приостановят торговлю". Это обещание никогда не выполнялось —
+            # тот же класс "пустого обещания", что уже чинили в spot_bot.py (v322/v326).
             # Глобальная блокировка рынка
-            global_block = bool(data.get('market_blocked') or data.get('global_block'))
+            global_block = bool(data.get('market_blocked') or data.get('global_block')
+                                 or data.get('panic'))
             self._news_cache_result = global_block
             self._news_cache_ts = _now
             if global_block:
