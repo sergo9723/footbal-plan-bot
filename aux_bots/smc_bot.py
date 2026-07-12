@@ -162,11 +162,18 @@ def _load_shared_blacklist() -> set:
         if os.path.exists(ban_file):
             with open(ban_file, "r", encoding="utf-8") as f:
                 ban_data = json.load(f)
+            # [FIX-aux2-BUG] КРИТИЧНО: реальный banned_coins.json (проверил файл, который
+            # пишет spot_bot.py) хранит список под ключом "banned" — а здесь искали "coins"
+            # или "blacklist", которых там никогда не было. Из-за этого весь Источник 2
+            # был мёртв с момента написания: smc_bot ни разу не подтягивал монеты, забаненные
+            # ВО ВРЕМЯ торгов (только статичный список из shared_blacklist.json при старте) —
+            # мог продолжать слать SMC-сигналы и TG-уведомления по монете, которую spot_bot
+            # только что забанил навсегда за stop_loss/dump_exit.
             # Поддерживаем оба формата: список и dict с reasons
             if isinstance(ban_data, list):
                 result |= set(ban_data)
             elif isinstance(ban_data, dict):
-                coins = ban_data.get("coins", ban_data.get("blacklist", []))
+                coins = ban_data.get("banned", ban_data.get("coins", ban_data.get("blacklist", [])))
                 result |= set(coins)
     except Exception as e:
         log(f"⚠️ [smc] banned_coins: {e}")

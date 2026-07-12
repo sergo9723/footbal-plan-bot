@@ -68,10 +68,17 @@ def calc_real_adx(highs: list, lows: list, closes: list, period: int = 14) -> fl
         for i in range(1, n):
             h, l, pc = highs[i], lows[i], closes[i-1]
             tr  = max(h-l, abs(h-pc), abs(l-pc))
-            pdm = max(h - highs[i-1], 0.0)
-            ndm = max(lows[i-1] - l, 0.0)
-            if pdm <= ndm: pdm = 0.0
-            elif ndm <= pdm: ndm = 0.0
+            # [FIX-aux2-BUG] Было max(h-highs[i-1],0.0)/max(lows[i-1]-l,0.0) + if/elif —
+            # на ТОЧНОМ равенстве up_move==dn_move (>0) "if pdm<=ndm: pdm=0.0" срабатывает
+            # (равенство попадает в "<="), но elif после этого уже не проверяется — ndm
+            # остаётся НЕобнулённым. У spot_bot.py (единый расчёт, на который ссылается
+            # комментарий выше) в этом случае обнуляются ОБА (строгое ">" с обеих сторон
+            # само по себе исключает и pdm, и ndm при равенстве) — то есть при тай-брейке
+            # эта копия и оригинал расходились. Переписано на ту же логику, что в spot_bot.
+            up_move = h - highs[i-1]
+            dn_move = lows[i-1] - l
+            pdm = up_move if (up_move > dn_move and up_move > 0) else 0.0
+            ndm = dn_move if (dn_move > up_move and dn_move > 0) else 0.0
             tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
         def wilder_smooth(data, p):
             s = sum(data[:p])
