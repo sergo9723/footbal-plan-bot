@@ -561,8 +561,34 @@ def save_signals(data: Dict):
     [FIX-aux-ATOMIC] Пишем во временный файл и атомарно подменяем — см. тот же фикс в
     correlation_bot.py. spot_bot.py читает smc_signals.json очень часто (каждый вход
     сверяется с ним), риск поймать недописанный файл здесь выше, чем у остальных ботов.
+
+    [FIX-v330-BUG] КРИТИЧНО: smc_signals.json пишут ДВА независимых процесса — этот
+    (smc_bot.py) и spot_bot.py (при входе в сделку помечает consumed_by_v170/
+    v170_trade_result или добавляет запись в independent_trades). data в памяти здесь
+    может быть загружена ещё в НАЧАЛЕ скана — а один скан идёт до 100+ секунд (50 монет ×
+    время анализа). Если за это время spot_bot.py успел что-то дописать, простая
+    перезапись файла нашей устаревшей копией это сотрёт (classic lost update — блокировка
+    на самой записи, как в spot_bot.py, эту гонку НЕ лечит, потому что окно расхождения —
+    минуты, а не миллисекунды записи). Перед записью подтягиваем с диска то, что реально
+    мог поменять spot_bot.py за время скана.
     """
     try:
+        if os.path.exists(SIGNALS_FILE):
+            try:
+                with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+                    _fresh = json.load(f)
+                if isinstance(_fresh, dict):
+                    data["independent_trades"] = _fresh.get(
+                        "independent_trades", data.get("independent_trades", []))
+                    _fresh_sigs = {s.get("symbol"): s for s in (_fresh.get("signals") or [])
+                                    if isinstance(s, dict)}
+                    for _s in data.get("signals", []):
+                        _fs = _fresh_sigs.get(_s.get("symbol"))
+                        if _fs and _fs.get("consumed_by_v170"):
+                            _s["consumed_by_v170"]  = _fs.get("consumed_by_v170")
+                            _s["v170_trade_result"] = _fs.get("v170_trade_result")
+            except Exception:
+                pass  # свежей версии нет/повреждена — пишем как есть, лучше чем упасть
         _tmp = SIGNALS_FILE + ".tmp"
         with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
