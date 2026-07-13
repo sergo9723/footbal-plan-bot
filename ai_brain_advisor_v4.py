@@ -168,7 +168,23 @@ class AIBrainAdvisor:
             self._api_cost_today  += self.COST_PER_CALL_USD
             self._last_call_ok_ts = time.time()
 
-            return data['content'][0]['text'].strip()
+            # [FIX-v331-4] Было data['content'][0]['text'] — падало с KeyError 'text',
+            # если ПЕРВЫЙ блок ответа не текстовый (модель может вернуть сперва блок
+            # другого типа). Подтверждено логом: 39 × "[AIAdvisor] API недоступен: 'text'"
+            # за месяц — и КАЖДЫЙ такой вызов уже был оплачен (счётчик выше инкрементирован,
+            # запрос до API дошёл), а ответ выбрасывался. Теперь собираем ВСЕ текстовые
+            # блоки ответа.
+            _blocks = data.get('content') or []
+            _texts = [b.get('text', '') for b in _blocks
+                      if isinstance(b, dict) and b.get('type') == 'text' and b.get('text')]
+            if not _texts:  # fallback: любой блок, где есть поле text
+                _texts = [b.get('text', '') for b in _blocks
+                          if isinstance(b, dict) and b.get('text')]
+            if not _texts:
+                self._last_error = f"ответ без текстовых блоков: types={[str((b or {}).get('type')) for b in _blocks][:5]}"
+                self._last_error_ts = time.time()
+                return None
+            return '\n'.join(_texts).strip()
 
         except Exception as e:
             # Бот продолжает работать без ИИ
