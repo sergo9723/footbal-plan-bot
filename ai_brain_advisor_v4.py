@@ -102,7 +102,7 @@ class AIBrainAdvisor:
     # ──────────────────────────────────────────────────────────────
     # БАЗОВЫЙ API ВЫЗОВ — всё через него
     # ──────────────────────────────────────────────────────────────
-    def _call_api(self, prompt: str, max_tokens: int = 500, timeout: float = 25.0) -> Optional[str]:
+    def _call_api(self, prompt: str, max_tokens: int = 500, timeout: float = 25.0, purpose: str = "") -> Optional[str]:
         """Вызов Claude API. Возвращает текст или None при ошибке.
 
         [FIX-v305-BUG] timeout параметр добавлен отдельно: ai_explain_loss/_run_nightly_report/
@@ -112,7 +112,24 @@ class AIBrainAdvisor:
         полный timeout=25с мог замораживать весь скан (а с ним — проверку позиции, стоп-лосс и
         т.д.) на до 25 секунд на каждую подходящую монету при каждом скане. Эти два места теперь
         передают короткий timeout (см. ниже) — то же решение, что уже применено к TG.send()/
-        /market//forecast (см. ROUND6/ROUND8)."""
+        /market//forecast (см. ROUND6/ROUND8).
+
+        [FIX-v336-BUG] КРИТИЧНО, найдено по прямому вопросу пользователя "почему не вижу, чтобы
+        ИИ помогал после сделок": сверил свежий лог за 3.5 дня (13-16 июля) — за это время
+        произошло 13 реальных убыточных выходов (АВАРИЙНАЯ ПРОДАЖА), а сообщение "ИИ-АНАЛИЗ
+        УБЫТКА" в Telegram пришло только ОДИН раз. 12 из 13 анализов исчезли молча — ни в логе,
+        ни в TG никакого следа, что попытка вообще была. Корень — ДВЕ проблемы разом:
+        (1) ai_score_symbol() вызывается СИНХРОННО из сканера при каждом кандидате со
+        score>=6.0 — потенциально десятки раз за день — и делит один и тот же дневной лимит
+        (50 вызовов) с анализом убытков, у которого своего резерва не было; если лимит исчерпан
+        сканированием, у анализа убытков просто не остаётся вызовов на весь остаток дня.
+        (2) _apply_loss_analysis() при text=None (сбой ЛЮБОЙ причины — лимит исчерпан, таймаут,
+        ошибка сети) тихо делал return без единого log()/TG.send() — снаружи невозможно было
+        понять, что механизм вообще пытался сработать, не говоря уже о причине сбоя.
+        Фикс (2) — ниже в _apply_loss_analysis. Фикс (1) — здесь: у анализа убытков теперь есть
+        РЕЗЕРВ (AI_LOSS_ANALYSIS_RESERVED_CALLS, по умолчанию 15 вызовов/день), который не может
+        занять никто, кроме purpose="loss_analysis" — это самая ценная функция (учится на
+        реальных деньгах), а не просто "ещё один кандидат из многих" как при сканировании."""
         try:
             key = str(getattr(self.cfg, 'ANTHROPIC_KEY', '') or '')
             if not key or not key.startswith('sk-ant-'):
@@ -132,6 +149,14 @@ class AIBrainAdvisor:
                 self._last_error = f"дневной лимит {self.MAX_CALLS_PER_DAY} вызовов исчерпан"
                 self._last_error_ts = time.time()
                 return None
+            # [FIX-v336-BUG] Резерв под анализ убытков — сканирование (и всё прочее) не может
+            # опуститься ниже этого запаса вызовов, чтобы у loss_analysis всегда были вызовы.
+            if purpose != "loss_analysis":
+                _reserved = int(getattr(self.cfg, 'AI_LOSS_ANALYSIS_RESERVED_CALLS', 15))
+                if self.MAX_CALLS_PER_DAY - self._api_calls_today <= _reserved:
+                    self._last_error = f"резерв под анализ убытков ({_reserved}) — сканирование пропускает вызов"
+                    self._last_error_ts = time.time()
+                    return None
 
             resp = requests.post(
                 'https://api.anthropic.com/v1/messages',
@@ -306,12 +331,41 @@ class AIBrainAdvisor:
     def _apply_loss_analysis(self, prompt: str, trade: dict) -> None:
         """Фоновый поток: вызывает API, применяет изменения, пишет в TG."""
         try:
-            text = self._call_api(prompt, max_tokens=600)
+            # [FIX-v336-BUG] purpose="loss_analysis" даёт этому вызову доступ к резерву
+            # AI_LOSS_ANALYSIS_RESERVED_CALLS — сканер (ai_score_symbol) не может занять
+            # последние N вызовов дня, они гарантированно остаются на анализ убытков.
+            text = self._call_api(prompt, max_tokens=600, purpose="loss_analysis")
             if not text:
+                # [FIX-v336-BUG] КРИТИЧНО, найдено по прямому вопросу пользователя "я не вижу,
+                # чтобы ИИ помогал после сделок". За 3.5 дня было 13 убытков, а сообщение
+                # "ИИ-АНАЛИЗ УБЫТКА" пришло только 1 раз — 12 попыток исчезали здесь молча (было:
+                # просто return, ни log(), ни TG.send()). Теперь при любом сбое ЛЮБОЙ причины
+                # (дневной лимит исчерпан сканированием, таймаут API, сетевая ошибка — точная
+                # причина уже копится в self._last_error) хотя бы видно, что мозг ПЫТАЛСЯ
+                # проанализировать эту сделку и не смог — не тишина, а диагностируемый факт.
+                try:
+                    import logging as _logging336
+                    _logging336.getLogger('spotbot').warning(
+                        f"[AIAdvisor] Анализ убытка {trade.get('symbol')} не выполнен: "
+                        f"{self._last_error or 'нет текста ответа'}")
+                except Exception:
+                    pass
+                if self.tg and getattr(self.tg, 'enabled', False):
+                    self.tg.send_throttled(
+                        'ai_loss_analysis_failed',
+                        f"🤖 ИИ не смог проанализировать убыток {trade.get('symbol')} "
+                        f"({trade.get('pnl_usdt', 0):+.4f} USDT)\nПричина: {self._last_error or 'нет ответа от API'}",
+                        cooldown_sec=1800, only_on_change=False)
                 return
 
             result = self._parse_json_response(text)
             if not result:
+                if self.tg and getattr(self.tg, 'enabled', False):
+                    self.tg.send_throttled(
+                        'ai_loss_analysis_failed',
+                        f"🤖 ИИ вернул нераспознаваемый ответ по убытку {trade.get('symbol')} "
+                        f"({trade.get('pnl_usdt', 0):+.4f} USDT) — анализ пропущен",
+                        cooldown_sec=1800, only_on_change=False)
                 return
 
             changes    = result.get('changes', {})
@@ -510,12 +564,18 @@ class AIBrainAdvisor:
                 self.knowledge._save()
 
             # Лог: при каких условиях получили профит
+            # [FIX-v336-BUG] `getattr(self, '_log_fn', None)` НИКОГДА не устанавливается нигде
+            # в коде (ни здесь, ни в spot_bot.py при создании AIBrainAdvisor) — всегда падало
+            # обратно на голый print(), который уходит в stdout процесса, а НЕ в файл лога
+            # (log() пишет через logging.getLogger('spotbot'), это другой канал). Сообщение
+            # "Анализ ПОБЕДЫ" было невидимым в принципе — ни в файле лога, ни где-либо ещё,
+            # ровно то, о чём вы спросили. Используем тот же логгер, что и весь остальной код.
             try:
-                from datetime import datetime
-                _log = getattr(self, '_log_fn', None) or print
-                _log(f"💚 [v277] Анализ ПОБЕДЫ {trade.get('symbol')}: "
-                     f"профит при ADX~{avg_win_adx:.0f}, RSI~{avg_win_rsi:.0f} | "
-                     f"всего побед: {len(wins)} | лучшие часы: {[h for h,_ in best_hours]}")
+                import logging as _logging336w
+                _logging336w.getLogger('spotbot').info(
+                    f"💚 [v277] Анализ ПОБЕДЫ {trade.get('symbol')}: "
+                    f"профит при ADX~{avg_win_adx:.0f}, RSI~{avg_win_rsi:.0f} | "
+                    f"всего побед: {len(wins)} | лучшие часы: {[h for h,_ in best_hours]}")
             except Exception:
                 pass
 
