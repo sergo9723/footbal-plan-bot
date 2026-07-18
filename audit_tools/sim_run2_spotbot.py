@@ -118,6 +118,38 @@ total_hour_trades = sum(int(v.get("trades",0)) for v in hs.values())
 print("Д: hour_stats сделок всего:", total_hour_trades)
 if total_hour_trades != 19: fails.append(f"Д: hour_stats={total_hour_trades}, ожидалось 19")
 
+# ---------- ЧАСТЬ Ж: клемп vs ослабление мозга (FIX-v340-CLAMP-ADX) ----------
+mCFG = m.CFG
+_saved = {k: getattr(mCFG, k, None) for k in ('SCANNER_ADX_MIN','SCANNER_RSI_MIN','SCANNER_RSI_MAX','SCANNER_MIN_TURNOVER_SCAN','MIN_SCORE_TO_ENTER','_filter_relaxed_by_brain')}
+_clamp = None
+for _n in dir(m):
+    _o = getattr(m, _n)
+    if isinstance(_o, type) and hasattr(_o, '_clamp_filters_to_strict_floor'):
+        _clamp = _o._clamp_filters_to_strict_floor
+        break
+class _Dummy: pass
+# Ж1: ослабление мозга активно → ADX=22 ДОЛЖЕН выжить (раньше молча поднимался до 28)
+mCFG._filter_relaxed_by_brain = True
+mCFG.SCANNER_ADX_MIN = 22.0
+_clamp(_Dummy())
+ok1 = float(mCFG.SCANNER_ADX_MIN) == 22.0
+# Ж2: ослабление НЕ активно → ADX=22 поднимается к строгому полу 28 (защита от мусора)
+mCFG._filter_relaxed_by_brain = False
+mCFG.SCANNER_ADX_MIN = 22.0
+_clamp(_Dummy())
+ok2 = float(mCFG.SCANNER_ADX_MIN) >= 28.0
+# Ж3: ADX=15 при активном ослаблении → поднимается к 22 (ниже минимума лестницы нельзя)
+mCFG._filter_relaxed_by_brain = True
+mCFG.SCANNER_ADX_MIN = 15.0
+_clamp(_Dummy())
+ok3 = float(mCFG.SCANNER_ADX_MIN) == 22.0
+print(f"Ж1 ADX=22 выживает при ослаблении: {ok1} | Ж2 ADX 22→28 без ослабления: {ok2} | Ж3 ADX 15→22 (пол лестницы): {ok3}")
+if not ok1: fails.append("Ж1: клемп всё ещё съедает ослабление ADX")
+if not ok2: fails.append("Ж2: строгий пол ADX=28 не работает")
+if not ok3: fails.append("Ж3: минимум 22 не защищён")
+for k, v in _saved.items():
+    if v is not None: setattr(mCFG, k, v)
+
 # ---------- ЧАСТЬ Е: сохранение/загрузка знаний (персистентность) ----------
 kn._save()
 kn2 = m.BotKnowledge(tmpdir)
@@ -127,5 +159,5 @@ if len(kn2._data.get("trades", [])) != 19: fails.append("Е: история сд
 print("Е: после save/load — строгое.trades =", rls2.get("строгое", {}).get("trades"), ", всего сделок =", len(kn2._data.get("trades", [])))
 
 print()
-print("ИТОГ ПРОГОНА №2:", "ВСЕ ПРОВЕРКИ ПРОШЛИ (А1,А2,Б1-Б4,В,Г1-Г3,Д,Е)" if not fails else "ПРОВАЛЫ: " + "; ".join(fails))
+print("ИТОГ ПРОГОНА №2:", "ВСЕ ПРОВЕРКИ ПРОШЛИ (А1,А2,Б1-Б4,В,Г1-Г3,Д,Е,Ж1-Ж3)" if not fails else "ПРОВАЛЫ: " + "; ".join(fails))
 sys.exit(1 if fails else 0)
