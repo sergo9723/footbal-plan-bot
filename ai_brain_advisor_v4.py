@@ -431,6 +431,13 @@ class AIBrainAdvisor:
                         new_rsi_min = max(18.0, min(45.0, float(new_rsi_min)))
                         if abs(new_rsi_min - cur) >= 1.0:
                             self.cfg.SCANNER_RSI_MIN = new_rsi_min
+                            # [FIX-v339-RSI-GUARD] Как _ai_adx_floor выше: без пола лестница
+                            # авто-ослабления в spot_bot откатывала ИИ-ужесточение RSI за
+                            # минуты (скриншоты 18.07: RSI_MAX 72→65 от ИИ, через минуту
+                            # 65→66 от лестницы). Пол/потолок действуют 24ч.
+                            if new_rsi_min > cur:
+                                self.cfg._ai_rsi_min_floor = new_rsi_min
+                                self.cfg._ai_rsi_min_floor_ts = time.time()
                             applied_changes.append(f"RSI_MIN {cur:.0f}→{new_rsi_min:.0f}")
                             self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = new_rsi_min
 
@@ -440,6 +447,11 @@ class AIBrainAdvisor:
                         new_rsi_max = max(55.0, min(75.0, float(new_rsi_max)))
                         if abs(new_rsi_max - cur) >= 1.0:
                             self.cfg.SCANNER_RSI_MAX = new_rsi_max
+                            # [FIX-v339-RSI-GUARD] Потолок 24ч: лестница не поднимет RSI_MAX
+                            # выше уровня, до которого ИИ его сузил после убытка.
+                            if new_rsi_max < cur:
+                                self.cfg._ai_rsi_max_ceil = new_rsi_max
+                                self.cfg._ai_rsi_max_ceil_ts = time.time()
                             applied_changes.append(f"RSI_MAX {cur:.0f}→{new_rsi_max:.0f}")
 
                     # Плохие часы
@@ -865,6 +877,10 @@ class AIBrainAdvisor:
                         v = max(18.0, min(45.0, float(v)))
                         if abs(v - cur) >= 1.0:
                             self.cfg.SCANNER_RSI_MIN = v
+                            # [FIX-v339-RSI-GUARD] См. тот же фикс в _apply_loss_analysis.
+                            if v > cur:
+                                self.cfg._ai_rsi_min_floor = v
+                                self.cfg._ai_rsi_min_floor_ts = time.time()
                             applied.append(f"RSI_MIN {cur:.0f}→{v:.0f}")
                             self.knowledge._data.setdefault('learned_cfg', {})['SCANNER_RSI_MIN'] = v
 
@@ -874,6 +890,10 @@ class AIBrainAdvisor:
                         v = max(55.0, min(78.0, float(v)))
                         if abs(v - cur) >= 1.0:
                             self.cfg.SCANNER_RSI_MAX = v
+                            # [FIX-v339-RSI-GUARD] См. тот же фикс в _apply_loss_analysis.
+                            if v < cur:
+                                self.cfg._ai_rsi_max_ceil = v
+                                self.cfg._ai_rsi_max_ceil_ts = time.time()
                             applied.append(f"RSI_MAX {cur:.0f}→{v:.0f}")
 
                     # SL

@@ -28,9 +28,12 @@ class FakeTG:
     def send(self, *a, **k): pass
     def send_throttled(self, *a, **k): pass
 
+import threading as _th
 class FakeKnowledge:
     _data = {}
+    _lock = _th.RLock()
     def save(self): pass
+    def _save(self): pass
 
 brain = adv.AIBrainAdvisor(FakeKnowledge(), FakeCfg(), FakeTG(), '/tmp')
 print("init: полный __init__ OK")
@@ -70,6 +73,23 @@ r_loss = brain._call_api("тест", max_tokens=600, purpose="loss_analysis")  #
 results['reserve_scan_blocked'] = (r_scan, brain._last_error if r_scan is None else None)
 results['reserve_loss_allowed'] = (r_loss, None)
 
+# Сценарий 7 (FIX-v339-RSI-GUARD): полный путь _apply_loss_analysis —
+# ИИ ужесточает RSI → должны выставиться пол RSI_MIN и потолок RSI_MAX на 24ч
+brain._api_calls_today = 0
+_ai_json = '{"diagnosis": "тест", "confidence": 80, "changes": {"SCANNER_ADX_MIN": 33, "SCANNER_RSI_MIN": 44, "SCANNER_RSI_MAX": 65}}'
+adv.requests.post = make_post({'content': [{'type': 'text', 'text': _ai_json}]})
+brain.cfg.SCANNER_RSI_MIN = 40.0
+brain.cfg.SCANNER_RSI_MAX = 72.0
+brain.cfg.SCANNER_ADX_MIN = 30.0
+brain._apply_loss_analysis("тестовый промпт", {"symbol": "MEGAUSDT", "pnl_usdt": -0.12, "exit_reason": "full_grid_early_stop"})
+_guard_ok = (getattr(brain.cfg, '_ai_rsi_min_floor', 0) == 44.0
+             and getattr(brain.cfg, '_ai_rsi_max_ceil', 0) == 65.0
+             and getattr(brain.cfg, '_ai_adx_floor', 0) == 33.0
+             and getattr(brain.cfg, '_ai_rsi_min_floor_ts', 0) > 0
+             and getattr(brain.cfg, '_ai_rsi_max_ceil_ts', 0) > 0)
+print("Сценарий 7 (RSI-защита после ИИ-ужесточения):",
+      f"floor={getattr(brain.cfg,'_ai_rsi_min_floor',None)} ceil={getattr(brain.cfg,'_ai_rsi_max_ceil',None)} adx_floor={getattr(brain.cfg,'_ai_adx_floor',None)} → {'OK' if _guard_ok else 'ПРОВАЛ'}")
+
 # ПРОВЕРКА ТЕЛА ЗАПРОСА: thinking выключен во всех отправленных запросах
 thinking_ok = all(b.get('thinking') == {'type': 'disabled'} for b in captured_bodies)
 model_ok = all(b.get('model') == 'claude-sonnet-5' for b in captured_bodies)
@@ -97,5 +117,6 @@ if results['reserve_scan_blocked'][0] is not None: fails.append("sc6-scan")
 if results['reserve_loss_allowed'][0] != 'ok': fails.append("sc6-loss")
 if not thinking_ok: fails.append("thinking")
 if not model_ok: fails.append("model")
+if not _guard_ok: fails.append("sc7-rsi-guard")
 print()
-print("ИТОГ ПРОГОНА №1:", "ВСЕ 9 ПРОВЕРОК ПРОШЛИ" if not fails else "ПРОВАЛЫ: " + ", ".join(fails))
+print("ИТОГ ПРОГОНА №1:", "ВСЕ 10 ПРОВЕРОК ПРОШЛИ" if not fails else "ПРОВАЛЫ: " + ", ".join(fails))

@@ -3,7 +3,12 @@
 # + серии убытков (посев из истории), + арифметика be_lock.
 import importlib.util, json, os, tempfile, sys
 
-spec = importlib.util.spec_from_file_location('spotbot', os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'spot_bot_v338_fixed.py'))
+import glob as _glob, re as _re
+_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_cands = _glob.glob(os.path.join(_repo, 'spot_bot_v*_fixed.py'))
+_latest = max(_cands, key=lambda p: int(_re.search(r'v(\d+)', os.path.basename(p)).group(1)))
+print('Проверяемая версия:', os.path.basename(_latest))
+spec = importlib.util.spec_from_file_location('spotbot', _latest)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
