@@ -466,6 +466,14 @@ class AIBrainAdvisor:
                                 added.append(h)
                         if added:
                             self.knowledge._data['bad_hours'] = cur_bad
+                            # [FIX-v342-WINDUP] apply_learning() в spot_bot.py каждые 100
+                            # сканов безусловно пересчитывает bad_hours заново из hour_stats
+                            # (порог 5+ сделок в часе) и стирал именно эти часы, добавленные
+                            # ИИ на выборке 1-3 сделки. Метка времени даёт apply_learning()
+                            # 24ч, чтобы сохранить их при пересчёте вместо слепой перезаписи.
+                            _ai_bad_ts = self.knowledge._data.setdefault('_ai_bad_hours_ts', {})
+                            for h in added:
+                                _ai_bad_ts[str(h)] = time.time()
                             applied_changes.append(f"bad_hours +{added}")
 
                     # MIN_SCORE
@@ -571,12 +579,21 @@ class AIBrainAdvisor:
             with self.knowledge._lock:
                 self.knowledge._data['win_profile'] = win_profile
 
-                # Помечаем хорошие монеты (повышаем доверие в symbol_stats)
+                # Помечаем хорошие монеты (доверие в symbol_stats)
                 try:
                     sym = trade.get('symbol', '')
                     if sym:
                         ss = self.knowledge._data.setdefault('symbol_stats', {}).setdefault(sym, {})
-                        ss['wins'] = ss.get('wins', 0) + 1
+                        # [FIX-v342-WINDUP] КРИТИЧНО, найдено по 4-дневному прогону v341:
+                        # эта строка независимо инкрементировала ss['wins'] при КАЖДОМ TP_fill/
+                        # BE_fill — те же самые победы уже посчитаны _update_stats() внутри
+                        # log_trade_exit(), который вызывается прямо перед ai_explain_win() в
+                        # том же самом коде (см. run(), строка вызова ai_explain_win). Двойной
+                        # счёт подтверждён на 3 монетах: XANUSDT 1 сделка(TP_fill)→symbol_stats
+                        # wins=2; SPXUSDT 2 победы(1 TP_fill)→wins=3; JUPUSDT 2 победы(обе
+                        # TP_fill)→wins=4 — везде расхождение равно числу TP_fill/BE_fill побед.
+                        # Мозг читал эти раздутые винрейты для шпаргалки/min_safe_adx/доверия.
+                        # ss['wins'] = ss.get('wins', 0) + 1  ← УБРАНО, дублирует _update_stats()
                         ss['last_win_adx'] = trade.get('adx')
                         ss['last_win_rsi'] = trade.get('rsi')
                 except Exception:
@@ -943,6 +960,10 @@ class AIBrainAdvisor:
                     if new_bad and isinstance(new_bad, list):
                         new_bad = [int(h) for h in new_bad[:8]]  # макс 8 часов
                         self.knowledge._data['bad_hours'] = new_bad
+                        # [FIX-v342-WINDUP] См. тот же фикс в _apply_loss_analysis.
+                        _ai_bad_ts = self.knowledge._data.setdefault('_ai_bad_hours_ts', {})
+                        for h in new_bad:
+                            _ai_bad_ts[str(h)] = time.time()
                         applied.append(f"bad_hours={new_bad}")
 
                     # Сохраняем
